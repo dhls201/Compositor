@@ -1,0 +1,96 @@
+name: Build macOS 15 DMG
+
+# Builds the app with MACOSX_DEPLOYMENT_TARGET=15.0 and publishes an ad-hoc
+# signed DMG as a release asset. The dmgs produced here are NOT notarized:
+# Gatekeeper refuses them on first open, so pass them with right-click > Open
+# or by clearing the quarantine attribute.
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    name: dmg (macOS 15, arm64)
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Select Xcode 26
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode_26.6.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.6.app
+          else
+            pick="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)"
+            if [ -z "$pick" ]; then pick="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"; fi
+            sudo xcode-select -s "$pick"
+          fi
+          xcodebuild -version
+          swift --version
+
+      - name: Resolve Swift packages
+        run: >
+          xcodebuild -resolvePackageDependencies
+          -project Compositor.xcodeproj
+          -scheme Compositor
+          -onlyUsePackageVersionsFromResolvedFile
+
+      - name: Archive (deployment target 15.0)
+        run: >
+          xcodebuild archive
+          -project Compositor.xcodeproj
+          -scheme Compositor
+          -configuration Release
+          -archivePath "$RUNNER_TEMP/Compositor.xcarchive"
+          -destination 'generic/platform=macOS'
+          MACOSX_DEPLOYMENT_TARGET=15.0
+          CODE_SIGNING_ALLOWED=NO
+          CODE_SIGNING_REQUIRED=NO
+          CODE_SIGN_IDENTITY=-
+
+      - name: Build DMG
+        id: dmg
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/Compositor.xcarchive/Products/Applications/Compositor.app"
+          test -d "$app"
+          echo "--- MinOS / version actually baked into the binary ---"
+          /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$app/Contents/Info.plist"
+          version="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$app/Contents/Info.plist")"
+          staging="$RUNNER_TEMP/dmg-staging"
+          rm -rf "$staging"; mkdir -p "$staging"
+          ditto "$app" "$staging/Compositor.app"
+          ln -s /Applications "$staging/Applications"
+          out="$RUNNER_TEMP/Compositor-${version}-macos15-arm64.dmg"
+          hdiutil create -volname "Compositor" -srcfolder "$staging" -format UDZO -ov "$out"
+          echo "path=$out" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          ls -la "$out"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Compositor-macos15-arm64
+          path: ${{ steps.dmg.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="macos15-v${{ steps.dmg.outputs.version }}-${{ github.run_number }}"
+          gh release create "$tag" "${{ steps.dmg.outputs.path }}" \
+            --title "Compositor ${{ steps.dmg.outputs.version }} (macOS 15 build)" \
+            --notes "Fork build with MACOSX_DEPLOYMENT_TARGET=15.0 so it runs on macOS 15 (Sequoia). Ad-hoc signed, not notarized: right-click > Open, or \`xattr -dr com.apple.quarantine\`." \
+            --target "$GITHUB_SHA"
